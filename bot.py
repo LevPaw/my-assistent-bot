@@ -6,13 +6,12 @@ from datetime import datetime, date
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (Application, CommandHandler, MessageHandler,
                            filters, ContextTypes, CallbackQueryHandler, ConversationHandler)
-import google.generativeai as genai
+from google import genai
+client = genai.Client(api_key=GEMINI_API_KEY)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-1.5-flash')
 
 logging.basicConfig(level=logging.INFO)
 
@@ -230,11 +229,11 @@ async def focus_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text("⏳ ИИ выбирает главную задачу дня...")
 
     try:
-        response = model.generate_content(
-            f"Вот список задач пользователя:\n{task_list}\n\n"
-            f"Выбери ОДНУ самую важную задачу на сегодня и объясни в 2-3 предложениях почему именно её стоит сделать первой. "
-            f"Ответь на русском, мотивирующе и кратко."
+               response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=f"Вот список задач пользователя:\n{task_list}\n\nВыбери ОДНУ самую важную задачу на сегодня и объясни в 2-3 предложениях почему именно её стоит сделать первой. Ответь на русском, мотивирующе и кратко."
         )
+
         text = f"😴 *Режим фокуса — задача дня:*\n\n{response.text}"
     except:
         chosen = random.choice(tasks)[0]
@@ -316,22 +315,18 @@ async def wheel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────
 # ИИ АССИСТЕНТ
 # ─────────────────────────────────────────
-
-async def ask_ai_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text("🤖 Напиши любой вопрос — отвечу с помощью ИИ!")
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
     await update.message.reply_text("⏳ Думаю...")
     try:
-        response = model.generate_content(
-            f"Ты личный ассистент. Отвечай кратко и по делу на русском. Вопрос: {user_text}"
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=f"Ты личный ассистент. Отвечай кратко и по делу на русском. Вопрос: {user_text}"
         )
         await update.message.reply_text(response.text)
     except Exception as e:
         await update.message.reply_text("Ошибка ИИ. Попробуй позже.")
+
 
 # ─────────────────────────────────────────
 # НАВИГАЦИЯ
