@@ -229,7 +229,7 @@ async def focus_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text("⏳ ИИ выбирает главную задачу дня...")
 
     try:
-               response = client.models.generate_content(
+        response = client.models.generate_content(
             model="gemini-2.0-flash",
             contents=f"Вот список задач пользователя:\n{task_list}\n\nВыбери ОДНУ самую важную задачу на сегодня и объясни в 2-3 предложениях почему именно её стоит сделать первой. Ответь на русском, мотивирующе и кратко."
         )
