@@ -1,377 +1,383 @@
-#!/usr/bin/env python3
-"""
-AI Personal Assistant + Колесо Фортуны (Gemini — БЕСПЛАТНО)
-pip install python-telegram-bot google-generativeai apscheduler
-"""
-
-import logging, sqlite3, random, asyncio, os
-from datetime import datetime, timedelta
-import google.generativeai as genai
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import os
+import logging
+import sqlite3
+import random
+from datetime import datetime, date
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters
-)
+from telegram.ext import (Application, CommandHandler, MessageHandler,
+                           filters, ContextTypes, CallbackQueryHandler, ConversationHandler)
+import google.generativeai as genai
 
-# Ключи берутся из переменных окружения (Railway) или вписаны напрямую
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "СЮДА_ВСТАВЬ_ТОКЕН_ОТ_BOTFATHER")
-GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY",  "СЮДА_ВСТАВЬ_КЛЮЧ_ОТ_GEMINI")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-# ─────────────────────────────────────────────
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel('gemini-1.5-flash')
 
 logging.basicConfig(level=logging.INFO)
-genai.configure(api_key=GEMINI_API_KEY)
 
-# ──────────────── База данных ────────────────
+# Состояния для ConversationHandler
+WAITING_TASK = 1
+WAITING_MOOD = 2
+
+# ─────────────────────────────────────────
+# БАЗА ДАННЫХ
+# ─────────────────────────────────────────
+
 def init_db():
-    conn = sqlite3.connect("assistant.db")
+    conn = sqlite3.connect("bot.db")
     c = conn.cursor()
-    c.execute("""CREATE TABLE IF NOT EXISTS tasks (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER, text TEXT, deadline TEXT,
-        done INTEGER DEFAULT 0, created_at TEXT
-    )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS notes (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER, text TEXT, created_at TEXT
-    )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS history (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER, role TEXT, content TEXT
-    )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS wheel_items (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER, text TEXT
-    )""")
-    conn.commit(); conn.close()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            task TEXT,
+            done INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT (date('now')),
+            done_at TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS mood (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            score INTEGER,
+            note TEXT,
+            created_at TEXT DEFAULT (date('now'))
+        )
+    """)
+    conn.commit()
+    conn.close()
 
 def db():
-    return sqlite3.connect("assistant.db")
+    return sqlite3.connect("bot.db")
 
-def get_open_tasks(user_id):
+# ─────────────────────────────────────────
+# ГЛАВНОЕ МЕНЮ
+# ─────────────────────────────────────────
+
+def main_menu_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋 Задачи", callback_data="tasks_menu"),
+         InlineKeyboardButton("📊 Статистика", callback_data="stats")],
+        [InlineKeyboardButton("😴 Режим фокуса", callback_data="focus"),
+         InlineKeyboardButton("🌡️ Настроение", callback_data="mood_menu")],
+        [InlineKeyboardButton("🎡 Колесо фортуны", callback_data="wheel"),
+         InlineKeyboardButton("🤖 Спросить ИИ", callback_data="ask_ai")],
+    ])
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Привет! Я твой личный ассистент!\nЧто хочешь сделать?",
+        reply_markup=main_menu_keyboard()
+    )
+
+async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Главное меню:", reply_markup=main_menu_keyboard())
+
+# ─────────────────────────────────────────
+# ЗАДАЧИ
+# ─────────────────────────────────────────
+
+def tasks_keyboard(user_id):
     conn = db()
-    rows = conn.execute(
-        "SELECT id, text, deadline FROM tasks WHERE user_id=? AND done=0 ORDER BY deadline",
+    tasks = conn.execute(
+        "SELECT id, task FROM tasks WHERE user_id=? AND done=0 ORDER BY id DESC LIMIT 10",
         (user_id,)
     ).fetchall()
     conn.close()
-    return rows
+    buttons = []
+    for task_id, task_text in tasks:
+        short = task_text[:30] + "..." if len(task_text) > 30 else task_text
+        buttons.append([
+            InlineKeyboardButton(f"✅ {short}", callback_data=f"done_{task_id}"),
+            InlineKeyboardButton("🗑️", callback_data=f"del_{task_id}")
+        ])
+    buttons.append([InlineKeyboardButton("➕ Добавить задачу", callback_data="add_task")])
+    buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="back_main")])
+    return InlineKeyboardMarkup(buttons)
 
-def get_wheel_items(user_id):
-    conn = db()
-    rows = conn.execute("SELECT id, text FROM wheel_items WHERE user_id=?", (user_id,)).fetchall()
-    conn.close()
-    return rows
-
-# ──────────────── Gemini AI ──────────────────
-def get_ai_response(user_id, user_message):
-    conn = db()
-    rows = conn.execute(
-        "SELECT role, content FROM history WHERE user_id=? ORDER BY id DESC LIMIT 12",
-        (user_id,)
-    ).fetchall()[::-1]
-    conn.close()
-
-    tasks = get_open_tasks(user_id)
-    task_list = "\n".join([f"- [{t[0]}] {t[1]} (дедлайн: {t[2] or 'нет'})" for t in tasks]) or "задач нет"
-
-    system_prompt = f"""Ты личный ИИ-ассистент пользователя в Telegram.
-Помогай не забывать о делах, мотивируй, напоминай. Будь дружелюбным,
-можешь пошутить, но всегда по делу. Отвечай кратко, по-русски.
-Открытые задачи: {task_list}
-Сейчас: {datetime.now().strftime("%d.%m.%Y %H:%M")}"""
-
-    history = []
-    for role, content in rows:
-        history.append({"role": "user" if role == "user" else "model", "parts": [content]})
-
-    model = genai.GenerativeModel(model_name="gemini-2.0-flash", system_instruction=system_prompt)
-    chat = model.start_chat(history=history)
-    reply = chat.send_message(user_message).text
-
-    conn = db()
-    conn.execute("INSERT INTO history (user_id, role, content) VALUES (?,?,?)", (user_id, "user", user_message))
-    conn.execute("INSERT INTO history (user_id, role, content) VALUES (?,?,?)", (user_id, "assistant", reply))
-    conn.commit(); conn.close()
-    return reply
-
-# ──────────────── Клавиатуры ─────────────────
-def main_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📋 Задачи",      callback_data="tasks"),
-         InlineKeyboardButton("➕ Добавить",     callback_data="add_task")],
-        [InlineKeyboardButton("✅ Закрыть задачу", callback_data="done_task"),
-         InlineKeyboardButton("📝 Заметки",     callback_data="notes")],
-        [InlineKeyboardButton("🎡 Колесо Фортуны", callback_data="wheel_menu")],
-        [InlineKeyboardButton("💬 Чат с ИИ",    callback_data="chat")]
-    ])
-
-def wheel_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎰 КРУТИТЬ!",         callback_data="wheel_spin")],
-        [InlineKeyboardButton("➕ Добавить вариант",  callback_data="wheel_add"),
-         InlineKeyboardButton("🗑 Очистить всё",      callback_data="wheel_clear")],
-        [InlineKeyboardButton("📜 Мои варианты",      callback_data="wheel_list")],
-        [InlineKeyboardButton("🏠 Меню",              callback_data="menu")]
-    ])
-
-# ──────────────── Анимация колеса ────────────
-WHEEL_FRAMES = ["🎡", "🌀", "💫", "⭐", "🌟", "✨", "🎯"]
-
-async def animate_wheel(message, items):
-    """Красивая анимация вращения колеса"""
-    text = message.text
-    for i in range(8):
-        frame = WHEEL_FRAMES[i % len(WHEEL_FRAMES)]
-        dots = "." * ((i % 3) + 1)
-        await message.edit_text(f"{frame} Колесо крутится{dots}\n\n" +
-                                "\n".join([f"{'👉' if i%len(items)==idx else '  '} {item[1]}"
-                                           for idx, item in enumerate(items)]))
-        await asyncio.sleep(0.4)
-
-# ──────────────── Хендлеры ───────────────────
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Привет! Я твой личный ИИ-ассистент на базе *Gemini* 🤖\n\n"
-        "• Напоминаю о делах и дедлайнах ⏰\n"
-        "• Помогаю планировать задачи 📋\n"
-        "• Крутю колесо фортуны, если не можешь выбрать 🎡\n\n"
-        "Выбери действие или просто напиши мне:",
-        parse_mode="Markdown", reply_markup=main_keyboard()
-    )
-
-async def menu_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Главное меню:", reply_markup=main_keyboard())
-
-async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def show_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    uid = query.from_user.id
-    data = query.data
-    back_main = [[InlineKeyboardButton("🏠 Меню", callback_data="menu")]]
-
-    # ── Главное меню ──
-    if data == "menu":
-        ctx.user_data["state"] = "chat"
-        await query.edit_message_text("Главное меню:", reply_markup=main_keyboard())
-
-    # ── Задачи ──
-    elif data == "tasks":
-        tasks = get_open_tasks(uid)
-        if not tasks:
-            text = "🎉 Открытых задач нет! Добавь новую."
-        else:
-            text = "📋 *Твои задачи:*\n\n"
-            for t in tasks:
-                dl = f"  ⏰ `{t[2]}`" if t[2] else ""
-                text += f"*[{t[0]}]* {t[1]}{dl}\n"
-        await query.edit_message_text(text, parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(back_main))
-
-    elif data == "add_task":
-        ctx.user_data["state"] = "waiting_task"
-        await query.edit_message_text(
-            "✏️ *Напиши задачу:*\n\n"
-            "Без дедлайна:\n`Сходить в магазин`\n\n"
-            "С дедлайном (через |):\n`Сдать отчёт | 25.03.2026 18:00`\n\n"
-            "/menu — отмена", parse_mode="Markdown")
-
-    elif data == "done_task":
-        tasks = get_open_tasks(uid)
-        if not tasks:
-            await query.edit_message_text("Нет открытых задач 🎉",
-                reply_markup=InlineKeyboardMarkup(back_main)); return
-        kb = [[InlineKeyboardButton(f"✅ [{t[0]}] {t[1][:35]}", callback_data=f"close_{t[0]}")] for t in tasks]
-        kb.append([InlineKeyboardButton("🏠 Меню", callback_data="menu")])
-        await query.edit_message_text("Выбери задачу для закрытия:",
-            reply_markup=InlineKeyboardMarkup(kb))
-
-    elif data.startswith("close_"):
-        task_id = int(data.split("_")[1])
-        conn = db()
-        conn.execute("UPDATE tasks SET done=1 WHERE id=? AND user_id=?", (task_id, uid))
-        conn.commit(); conn.close()
-        praise = get_ai_response(uid, "Я только что выполнил задачу! Похвали меня в 1-2 предложения с эмодзи.")
-        await query.edit_message_text(f"✅ Задача #{task_id} закрыта!\n\n{praise}",
-            reply_markup=InlineKeyboardMarkup(back_main))
-
-    elif data == "notes":
-        conn = db()
-        rows = conn.execute(
-            "SELECT id, text, created_at FROM notes WHERE user_id=? ORDER BY id DESC LIMIT 10", (uid,)
-        ).fetchall(); conn.close()
-        if not rows:
-            text = "📝 Заметок нет.\nДобавь: /note <текст>"
-        else:
-            text = "📝 *Заметки:*\n\n" + "\n".join([f"`{r[0]}.` {r[1]}" for r in rows])
-        await query.edit_message_text(text, parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(back_main))
-
-    elif data == "chat":
-        ctx.user_data["state"] = "chat"
-        await query.edit_message_text(
-            "💬 Режим чата с Gemini!\n\nПиши что угодно. /menu — вернуться.")
-
-    # ── Колесо Фортуны ──
-    elif data == "wheel_menu":
-        items = get_wheel_items(uid)
-        count = len(items)
-        text = f"🎡 *Колесо Фортуны*\n\n"
-        text += f"Вариантов на колесе: *{count}*\n" if count else "Колесо пустое! Добавь варианты.\n"
-        if items:
-            text += "\n".join([f"• {item[1]}" for item in items[:8]])
-            if count > 8: text += f"\n_...и ещё {count-8}_"
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=wheel_keyboard())
-
-    elif data == "wheel_add":
-        ctx.user_data["state"] = "waiting_wheel_item"
-        await query.edit_message_text(
-            "🎡 Напиши вариант для колеса\n\n"
-            "Например: `Сделать зарядку` или `Выучить 10 слов`\n\n/menu — отмена",
-            parse_mode="Markdown")
-
-    elif data == "wheel_list":
-        items = get_wheel_items(uid)
-        if not items:
-            text = "🎡 Колесо пустое! Добавь варианты через ➕"
-        else:
-            text = "🎡 *Варианты на колесе:*\n\n"
-            text += "\n".join([f"`{i[0]}.` {i[1]}" for i in items])
-            text += "\n\n_Чтобы удалить один: /delwheel <номер>_"
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=wheel_keyboard())
-
-    elif data == "wheel_clear":
-        conn = db()
-        conn.execute("DELETE FROM wheel_items WHERE user_id=?", (uid,))
-        conn.commit(); conn.close()
-        await query.edit_message_text("🗑 Колесо очищено!", reply_markup=wheel_keyboard())
-
-    elif data == "wheel_spin":
-        items = get_wheel_items(uid)
-        if not items:
-            await query.edit_message_text(
-                "🎡 Колесо пустое!\nДобавь варианты через ➕", reply_markup=wheel_keyboard()); return
-        if len(items) < 2:
-            await query.edit_message_text(
-                "🎡 Добавь хотя бы 2 варианта!", reply_markup=wheel_keyboard()); return
-
-        # Анимация
-        await animate_wheel(query.message, items)
-
-        # Результат
-        winner = random.choice(items)
-        comment = get_ai_response(uid,
-            f'Колесо фортуны выбрало задачу: "{winner[1]}". '
-            f'Прокомментируй в 1-2 предложениях с азартом и мотивацией!')
-        result_text = (
-            f"🎯 *Колесо остановилось на:*\n\n"
-            f"🏆 *{winner[1]}*\n\n"
-            f"{comment}"
-        )
-        await query.message.edit_text(result_text, parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🎰 Крутить ещё!", callback_data="wheel_spin")],
-                [InlineKeyboardButton("🎡 К колесу", callback_data="wheel_menu"),
-                 InlineKeyboardButton("🏠 Меню", callback_data="menu")]
-            ]))
-
-# ──────────────── Текстовые сообщения ────────
-async def message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    text = update.message.text
-    state = ctx.user_data.get("state", "chat")
-
-    if state == "waiting_task":
-        ctx.user_data["state"] = "chat"
-        parts = text.split("|")
-        task_text = parts[0].strip()
-        deadline = parts[1].strip() if len(parts) > 1 else None
-        conn = db()
-        conn.execute("INSERT INTO tasks (user_id, text, deadline, created_at) VALUES (?,?,?,?)",
-                     (uid, task_text, deadline, datetime.now().strftime("%d.%m.%Y %H:%M")))
-        conn.commit(); conn.close()
-        dl_text = f"\n⏰ Дедлайн: `{deadline}`" if deadline else ""
-        await update.message.reply_text(
-            f"✅ Задача добавлена!\n*{task_text}*{dl_text}",
-            parse_mode="Markdown", reply_markup=main_keyboard())
-
-    elif state == "waiting_wheel_item":
-        ctx.user_data["state"] = "chat"
-        conn = db()
-        conn.execute("INSERT INTO wheel_items (user_id, text) VALUES (?,?)", (uid, text.strip()))
-        conn.commit(); conn.close()
-        items = get_wheel_items(uid)
-        await update.message.reply_text(
-            f"🎡 Добавлено: *{text.strip()}*\nВсего на колесе: {len(items)} вариантов",
-            parse_mode="Markdown", reply_markup=wheel_keyboard())
-
-    else:
-        await update.message.chat.send_action("typing")
-        reply = get_ai_response(uid, text)
-        await update.message.reply_text(reply)
-
-async def note_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    note_text = " ".join(ctx.args)
-    if not note_text:
-        await update.message.reply_text("Напиши: /note <текст>"); return
+    user_id = query.from_user.id
     conn = db()
-    conn.execute("INSERT INTO notes (user_id, text, created_at) VALUES (?,?,?)",
-                 (uid, note_text, datetime.now().strftime("%d.%m.%Y %H:%M")))
-    conn.commit(); conn.close()
-    await update.message.reply_text(f"📝 Заметка сохранена: *{note_text}*", parse_mode="Markdown")
+    total = conn.execute("SELECT COUNT(*) FROM tasks WHERE user_id=? AND done=0", (user_id,)).fetchone()[0]
+    conn.close()
+    text = f"📋 *Твои активные задачи* ({total} шт.):" if total > 0 else "📋 У тебя нет активных задач!"
+    await query.edit_message_text(text, reply_markup=tasks_keyboard(user_id), parse_mode="Markdown")
 
-async def delwheel_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not ctx.args:
-        await update.message.reply_text("Напиши: /delwheel <номер>"); return
-    item_id = int(ctx.args[0])
+async def add_task_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("✏️ Напиши название задачи:")
+    return WAITING_TASK
+
+async def save_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    task_text = update.message.text
     conn = db()
-    conn.execute("DELETE FROM wheel_items WHERE id=? AND user_id=?", (item_id, uid))
-    conn.commit(); conn.close()
-    await update.message.reply_text(f"🗑 Вариант #{item_id} удалён!", reply_markup=wheel_keyboard())
+    conn.execute("INSERT INTO tasks (user_id, task) VALUES (?, ?)", (user_id, task_text))
+    conn.commit()
+    conn.close()
+    await update.message.reply_text(
+        f"✅ Задача добавлена: *{task_text}*",
+        parse_mode="Markdown",
+        reply_markup=main_menu_keyboard()
+    )
+    return ConversationHandler.END
 
-# ──────────────── Напоминания ────────────────
-async def send_reminders(app: Application):
-    now = datetime.now()
+async def complete_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    task_id = int(query.data.split("_")[1])
+    user_id = query.from_user.id
+    conn = db()
+    conn.execute("UPDATE tasks SET done=1, done_at=date('now') WHERE id=?", (task_id,))
+    conn.commit()
+    conn.close()
+    await query.edit_message_text(
+        "🎉 Задача выполнена! Молодец! 💪",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📋 К задачам", callback_data="tasks_menu")],
+            [InlineKeyboardButton("🏠 Главное меню", callback_data="back_main")]
+        ])
+    )
+
+async def delete_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    task_id = int(query.data.split("_")[1])
+    user_id = query.from_user.id
+    conn = db()
+    conn.execute("DELETE FROM tasks WHERE id=? AND user_id=?", (task_id, user_id))
+    conn.commit()
+    conn.close()
+    await query.edit_message_text(
+        "🗑️ Задача удалена.",
+        reply_markup=tasks_keyboard(user_id)
+    )
+
+# ─────────────────────────────────────────
+# СТАТИСТИКА
+# ─────────────────────────────────────────
+
+async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    conn = db()
+    total_done = conn.execute(
+        "SELECT COUNT(*) FROM tasks WHERE user_id=? AND done=1", (user_id,)
+    ).fetchone()[0]
+    week_done = conn.execute(
+        "SELECT COUNT(*) FROM tasks WHERE user_id=? AND done=1 AND done_at >= date('now', '-7 days')",
+        (user_id,)
+    ).fetchone()[0]
+    month_done = conn.execute(
+        "SELECT COUNT(*) FROM tasks WHERE user_id=? AND done=1 AND done_at >= date('now', '-30 days')",
+        (user_id,)
+    ).fetchone()[0]
+    active = conn.execute(
+        "SELECT COUNT(*) FROM tasks WHERE user_id=? AND done=0", (user_id,)
+    ).fetchone()[0]
+    avg_mood = conn.execute(
+        "SELECT AVG(score) FROM mood WHERE user_id=? AND created_at >= date('now', '-7 days')",
+        (user_id,)
+    ).fetchone()[0]
+    conn.close()
+
+    mood_text = f"{avg_mood:.1f}/5 😊" if avg_mood else "нет данных"
+    bars_week = "🟩" * week_done + "⬜" * max(0, 7 - week_done)
+
+    text = (
+        f"📊 *Твоя статистика*\n\n"
+        f"✅ За эту неделю: *{week_done}* задач\n"
+        f"{bars_week}\n\n"
+        f"📅 За месяц: *{month_done}* задач\n"
+        f"🏆 Всего выполнено: *{total_done}* задач\n"
+        f"📋 Активных задач: *{active}*\n\n"
+        f"🌡️ Среднее настроение (7 дней): *{mood_text}*"
+    )
+    await query.edit_message_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="back_main")]])
+    )
+
+# ─────────────────────────────────────────
+# РЕЖИМ ФОКУСА
+# ─────────────────────────────────────────
+
+async def focus_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
     conn = db()
     tasks = conn.execute(
-        "SELECT user_id, text, deadline FROM tasks WHERE done=0 AND deadline IS NOT NULL"
-    ).fetchall(); conn.close()
-    for user_id, text, deadline in tasks:
-        try:
-            dl = datetime.strptime(deadline, "%d.%m.%Y %H:%M")
-            hours = (dl - now).total_seconds() / 3600
-            if 0 < hours <= 2:
-                msg = f"🚨 *Срочно!* Через ~{int(hours*60)} мин дедлайн:\n*{text}*"
-            elif 2 < hours <= 24:
-                msg = f"⏰ *Напоминание!* До дедлайна {int(hours)} ч.:\n*{text}*"
-            elif -1 < hours <= 0:
-                msg = f"😬 *Дедлайн прошёл!*\n*{text}*\n\nЧто там с этим?"
-            else:
-                continue
-            await app.bot.send_message(chat_id=user_id, text=msg, parse_mode="Markdown")
-        except Exception:
-            continue
+        "SELECT task FROM tasks WHERE user_id=? AND done=0", (user_id,)
+    ).fetchall()
+    conn.close()
 
-# ──────────────── Запуск ─────────────────────
+    if not tasks:
+        await query.edit_message_text(
+            "😴 У тебя нет активных задач!\nДобавь задачи через меню.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="back_main")]])
+        )
+        return
+
+    task_list = "\n".join([f"- {t[0]}" for t in tasks])
+    await query.edit_message_text("⏳ ИИ выбирает главную задачу дня...")
+
+    try:
+        response = model.generate_content(
+            f"Вот список задач пользователя:\n{task_list}\n\n"
+            f"Выбери ОДНУ самую важную задачу на сегодня и объясни в 2-3 предложениях почему именно её стоит сделать первой. "
+            f"Ответь на русском, мотивирующе и кратко."
+        )
+        text = f"😴 *Режим фокуса — задача дня:*\n\n{response.text}"
+    except:
+        chosen = random.choice(tasks)[0]
+        text = f"😴 *Задача дня:*\n\n🎯 {chosen}\n\nСосредоточься на этом!"
+
+    await query.edit_message_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="back_main")]])
+    )
+
+# ─────────────────────────────────────────
+# НАСТРОЕНИЕ
+# ─────────────────────────────────────────
+
+async def mood_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("😞 1", callback_data="mood_1"),
+            InlineKeyboardButton("😕 2", callback_data="mood_2"),
+            InlineKeyboardButton("😐 3", callback_data="mood_3"),
+            InlineKeyboardButton("😊 4", callback_data="mood_4"),
+            InlineKeyboardButton("😄 5", callback_data="mood_5"),
+        ],
+        [InlineKeyboardButton("🔙 Назад", callback_data="back_main")]
+    ])
+    await query.edit_message_text("🌡️ Как твоё настроение сегодня?\nОцени от 1 до 5:", reply_markup=keyboard)
+
+async def save_mood(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    score = int(query.data.split("_")[1])
+    emojis = {1: "😞", 2: "😕", 3: "😐", 4: "😊", 5: "😄"}
+
+    conn = db()
+    conn.execute("INSERT INTO mood (user_id, score) VALUES (?, ?)", (user_id, score))
+    conn.commit()
+    conn.close()
+
+    responses = {
+        1: "Держись! Завтра будет лучше 💙",
+        2: "Всё наладится, ты справишься 🙌",
+        3: "Нейтральный день — тоже норм 👍",
+        4: "Отлично, продолжай в том же духе! ⚡",
+        5: "Ты в ударе сегодня! 🔥"
+    }
+    await query.edit_message_text(
+        f"{emojis[score]} Настроение {score}/5 сохранено!\n\n{responses[score]}",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="back_main")]])
+    )
+
+# ─────────────────────────────────────────
+# КОЛЕСО ФОРТУНЫ
+# ─────────────────────────────────────────
+
+async def wheel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    conn = db()
+    tasks = conn.execute(
+        "SELECT task FROM tasks WHERE user_id=? AND done=0", (user_id,)
+    ).fetchall()
+    conn.close()
+    if tasks:
+        chosen = random.choice(tasks)[0]
+        text = f"🎡 Колесо фортуны выбрало:\n\n*{chosen}*\n\nВперёд! 💪"
+    else:
+        text = "Сначала добавь задачи!"
+    await query.edit_message_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="back_main")]])
+    )
+
+# ─────────────────────────────────────────
+# ИИ АССИСТЕНТ
+# ─────────────────────────────────────────
+
+async def ask_ai_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("🤖 Напиши любой вопрос — отвечу с помощью ИИ!")
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_text = update.message.text
+    await update.message.reply_text("⏳ Думаю...")
+    try:
+        response = model.generate_content(
+            f"Ты личный ассистент. Отвечай кратко и по делу на русском. Вопрос: {user_text}"
+        )
+        await update.message.reply_text(response.text)
+    except Exception as e:
+        await update.message.reply_text("Ошибка ИИ. Попробуй позже.")
+
+# ─────────────────────────────────────────
+# НАВИГАЦИЯ
+# ─────────────────────────────────────────
+
+async def back_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Главное меню:", reply_markup=main_menu_keyboard())
+
+async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data
+    if data == "tasks_menu":   await show_tasks(update, context)
+    elif data == "stats":      await show_stats(update, context)
+    elif data == "focus":      await focus_mode(update, context)
+    elif data == "mood_menu":  await mood_menu(update, context)
+    elif data == "wheel":      await wheel(update, context)
+    elif data == "ask_ai":     await ask_ai_prompt(update, context)
+    elif data == "back_main":  await back_main(update, context)
+    elif data.startswith("done_"):   await complete_task(update, context)
+    elif data.startswith("del_"):    await delete_task(update, context)
+    elif data.startswith("mood_") and data[5:].isdigit(): await save_mood(update, context)
+
+# ─────────────────────────────────────────
+# ЗАПУСК
+# ─────────────────────────────────────────
+
 def main():
     init_db()
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start",    start))
-    app.add_handler(CommandHandler("menu",     menu_cmd))
-    app.add_handler(CommandHandler("note",     note_cmd))
-    app.add_handler(CommandHandler("delwheel", delwheel_cmd))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(send_reminders, "interval", minutes=30, args=[app])
-    scheduler.start()
+    conv_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(add_task_prompt, pattern="^add_task$")],
+        states={WAITING_TASK: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_task)]},
+        fallbacks=[CommandHandler("menu", menu)]
+    )
 
-    print("✅ Бот запущен! Нажми Ctrl+C чтобы остановить.")
-    app.run_polling(drop_pending_updates=True)
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("menu", menu))
+    app.add_handler(conv_handler)
+    app.add_handler(CallbackQueryHandler(button_router))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    print("Бот запущен!")
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
