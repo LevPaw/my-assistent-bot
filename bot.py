@@ -192,9 +192,9 @@ async def focus_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
             contents=f"Вот список задач пользователя:\n{task_list}\n\nВыбери ОДНУ самую важную задачу на сегодня и объясни в 2-3 предложениях почему именно её стоит сделать первой. Ответь на русском, мотивирующе и кратко."
         )
         text = f"😴 *Режим фокуса — задача дня:*\n\n{response.text}"
-    except Exception:
+    except Exception as e:
         chosen = random.choice(tasks)[0]
-        text = f"😴 *Задача дня:*\n\n🎯 {chosen}\n\nСосредоточься на этом!"
+        text = f"😴 Задача дня: {chosen}\n\n⚠️ ИИ ошибка: {str(e)}"
     await query.edit_message_text(
         text,
         parse_mode="Markdown",
@@ -270,8 +270,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             contents=f"Ты личный ассистент. Отвечай кратко и по делу на русском. Вопрос: {user_text}"
         )
         await update.message.reply_text(response.text)
-    except Exception:
-        await update.message.reply_text("Ошибка ИИ. Попробуй позже.")
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Ошибка ИИ: {str(e)}")
 
 async def back_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -287,8 +287,8 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "wheel":        await wheel(update, context)
     elif data == "ask_ai":       await ask_ai_prompt(update, context)
     elif data == "back_main":    await back_main(update, context)
-    elif data.startswith("done_"):                  await complete_task(update, context)
-    elif data.startswith("del_"):                   await delete_task(update, context)
+    elif data.startswith("done_"):                       await complete_task(update, context)
+    elif data.startswith("del_"):                        await delete_task(update, context)
     elif data.startswith("mood_") and data[5:].isdigit(): await save_mood(update, context)
 
 def main():
