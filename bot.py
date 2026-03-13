@@ -2,15 +2,16 @@ import os
 import logging
 import sqlite3
 import random
+import google.generativeai as genai
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (Application, CommandHandler, MessageHandler,
                            filters, ContextTypes, CallbackQueryHandler, ConversationHandler)
-from google import genai
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel('gemini-1.5-flash')
 
 logging.basicConfig(level=logging.INFO)
 
@@ -187,9 +188,8 @@ async def focus_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     task_list = "\n".join([f"- {t[0]}" for t in tasks])
     await query.edit_message_text("⏳ ИИ выбирает главную задачу дня...")
     try:
-        response = client.models.generate_content(
-            model="gemini-1.5-flash",
-            contents=f"Вот список задач пользователя:\n{task_list}\n\nВыбери ОДНУ самую важную задачу на сегодня и объясни в 2-3 предложениях почему именно её стоит сделать первой. Ответь на русском, мотивирующе и кратко."
+        response = model.generate_content(
+            f"Вот список задач пользователя:\n{task_list}\n\nВыбери ОДНУ самую важную задачу на сегодня и объясни в 2-3 предложениях почему именно её стоит сделать первой. Ответь на русском, мотивирующе и кратко."
         )
         text = f"😴 *Режим фокуса — задача дня:*\n\n{response.text}"
     except Exception as e:
@@ -265,9 +265,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
     await update.message.reply_text("⏳ Думаю...")
     try:
-        response = client.models.generate_content(
-            model="gemini-1.5-flash",
-            contents=f"Ты личный ассистент. Отвечай кратко и по делу на русском. Вопрос: {user_text}"
+        response = model.generate_content(
+            f"Ты личный ассистент. Отвечай кратко и по делу на русском. Вопрос: {user_text}"
         )
         await update.message.reply_text(response.text)
     except Exception as e:
@@ -287,8 +286,8 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "wheel":        await wheel(update, context)
     elif data == "ask_ai":       await ask_ai_prompt(update, context)
     elif data == "back_main":    await back_main(update, context)
-    elif data.startswith("done_"):                       await complete_task(update, context)
-    elif data.startswith("del_"):                        await delete_task(update, context)
+    elif data.startswith("done_"):                        await complete_task(update, context)
+    elif data.startswith("del_"):                         await delete_task(update, context)
     elif data.startswith("mood_") and data[5:].isdigit(): await save_mood(update, context)
 
 def main():
